@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 """
-Resource Monitor - Auto-Scale to GCP when usage exceeds 75%
-Assignment 3: Cloud Computing
+monitor.py  –  Resource Monitor with:
+  - Local VM CPU/memory tracking
+  - GCP instance creation/deletion (scale-out / scale-in)
+  - Nginx upstream config auto-update
+  - GCP instance CPU monitoring (calls /metrics on each instance)
+  - GCP-side autoscaling (if any GCP instance > 75%, create another)
+  - Shared state.json for the dashboard
+
+Assignment 3 – Cloud Computing
 """
 
-import psutil
-import time
-import subprocess
-import logging
-import os
+import psutil, time, subprocess, logging, json, os, urllib.request
 from datetime import datetime
+from pathlib import Path
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-THRESHOLD        = 75.0          # % CPU or Memory to trigger scale-out
-CHECK_INTERVAL   = 30            # seconds between checks
-COOLDOWN_PERIOD  = 300           # 5 min cooldown after a scale action
-LOG_FILE         = "monitor.log"
+# ─── Configuration ─────────────────────────────────────────────────────────
+THRESHOLD        = 75.0
+CHECK_INTERVAL   = 30
+COOLDOWN_PERIOD  = 300        # 5 min between scale actions
+MAX_GCP_INSTANCES = 3         # hard cap on cloud VMs
 
-# GCP settings (edit these)
 GCP_PROJECT      = "cloudburstarchitecture"
 GCP_ZONE         = "us-central1-a"
-GCP_INSTANCE_NAME= "autoscale-instance"
 GCP_MACHINE_TYPE = "e2-medium"
 GCP_IMAGE_FAMILY = "ubuntu-2204-lts"
 GCP_IMAGE_PROJECT= "ubuntu-os-cloud"
-APP_STARTUP_SCRIPT= "startup.sh"      # uploaded to instance on creation
-# ──────────────────────────────────────────────────────────────────────────────
+
+LOG_FILE         = "monitor.log"
+STATE_FILE       = "state.json"
+NGINX_CONF       = "/etc/nginx/sites-enabled/vcc-webapp.conf"
+# ───────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,62 +42,212 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Track state
-scaled_out     = False
-last_scale_time = 0
+# Runtime state
+gcp_instances    = {}    # name -> {"ip": str, "cpu": float, "status": str}
+last_scale_time  = 0     # cooldown guard
 
 
-def get_cpu_percent(interval: float = 1.0) -> float:
-    return psutil.cpu_percent(interval=interval)
+# ─── Nginx ─────────────────────────────────────────────────────────────────
+
+def write_nginx_conf():
+    """Rewrite nginx upstream with local + all running GCP instances."""
+    lines = ["    server 127.0.0.1:5000 weight=1;"]
+    for name, info in gcp_instances.items():
+        if info.get("ip") and info.get("status") == "RUNNING":
+            lines.append(f"    server {info['ip']}:5000 weight=1;  # {name}")
+
+    conf = """upstream vcc_backends {{
+{backends}
+}}
+
+server {{
+    listen 80;
+    server_name _;
+
+    location / {{
+        proxy_pass         http://vcc_backends;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        add_header         X-Served-By $upstream_addr always;
+    }}
+
+    location /nginx_status {{
+        stub_status on;
+        allow 127.0.0.1;
+        deny  all;
+    }}
+}}
+""".format(backends="\n".join(lines))
+
+    try:
+        with open(NGINX_CONF, "w") as f:
+            f.write(conf)
+        result = subprocess.run(["sudo", "nginx", "-s", "reload"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            log.info("Nginx reloaded — %d backend(s) active", len(lines))
+        else:
+            log.error("Nginx reload failed: %s", result.stderr.strip())
+    except Exception as e:
+        log.error("Failed to write nginx conf: %s", e)
 
 
-def get_memory_percent() -> float:
-    return psutil.virtual_memory().percent
+# ─── State ─────────────────────────────────────────────────────────────────
+
+def save_state(local_cpu, local_mem):
+    state = {
+        "local_cpu":      local_cpu,
+        "local_mem":      local_mem,
+        "scaled_out":     len(gcp_instances) > 0,
+        "instance_count": len(gcp_instances),
+        "instances":      [{"name": k, **v} for k, v in gcp_instances.items()],
+        "last_update":    datetime.now().isoformat(),
+        "threshold":      THRESHOLD,
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# ─── GCP helpers ───────────────────────────────────────────────────────────
+
+def get_instance_ip(name: str) -> str | None:
+    r = subprocess.run([
+        "gcloud", "compute", "instances", "describe", name,
+        "--zone", GCP_ZONE, "--project", GCP_PROJECT,
+        "--format=value(networkInterfaces[0].accessConfigs[0].natIP)"
+    ], capture_output=True, text=True)
+    return r.stdout.strip() or None if r.returncode == 0 else None
 
 
 def is_instance_running(name: str) -> bool:
-    """Check if GCP instance exists and is RUNNING."""
-    result = subprocess.run(
-        ["gcloud", "compute", "instances", "describe", name,
-         "--zone", GCP_ZONE, "--project", GCP_PROJECT,
-         "--format=value(status)"],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0 and result.stdout.strip() == "RUNNING"
+    r = subprocess.run([
+        "gcloud", "compute", "instances", "describe", name,
+        "--zone", GCP_ZONE, "--project", GCP_PROJECT,
+        "--format=value(status)"
+    ], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "RUNNING"
 
 
-def create_gcp_instance() -> bool:
-    log.info("Creating GCP instance: %s", GCP_INSTANCE_NAME)
+def poll_instance_cpu(ip: str) -> float | None:
+    """Call /metrics on a GCP instance. Returns CPU % or None on failure."""
+    try:
+        req = urllib.request.Request(f"http://{ip}:5000/metrics", method="GET")
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read())
+            return data.get("cpu_percent")
+    except Exception:
+        return None
 
-    # Write startup script to a temp file
-    startup_content = """#!/bin/bash
-                        apt-get update -y
-                        apt-get install -y python3-pip
-                        pip3 install flask --break-system-packages
-                        cat > /tmp/app.py << 'APPEOF'
-                        from flask import Flask
-                        app = Flask(__name__)
 
-                        @app.route('/')
-                        def home():
-                            return '<h1>Auto-Scaled App Running on GCP!</h1>'
+def next_instance_name() -> str | None:
+    existing = set(gcp_instances.keys())
+    for i in range(MAX_GCP_INSTANCES):
+        name = f"autoscale-instance-{i}"
+        if name not in existing:
+            return name
+    return None
 
-                        @app.route('/health')
-                        def health():
-                            return 'ok', 200
 
-                        if __name__ == '__main__':
-                            app.run(host='0.0.0.0', port=80)
-                        APPEOF
-                        nohup python3 /tmp/app.py &> /tmp/app.log &
-                        """
+STARTUP_SCRIPT = """#!/bin/bash
+apt-get update -y
+apt-get install -y python3-pip
+pip3 install flask psutil --break-system-packages
+cat > /tmp/app.py << 'PYEOF'
+from flask import Flask, jsonify, render_template_string, request
+import platform, psutil, socket, datetime, urllib.request
 
-    startup_file = "/tmp/gcp_startup.sh"
+app = Flask(__name__)
+
+HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VCC Auto-Scaled App</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: Arial, sans-serif; background: #f0f4f8; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .card { background: white; border-radius: 16px; padding: 40px; max-width: 600px; width: 100%;
+          box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+  h1 { font-size: 22px; color: #1a1a2e; margin-bottom: 8px; }
+  .badge { display: inline-block; padding: 4px 14px; border-radius: 20px; font-size: 12px;
+           font-weight: 600; background: #e6f4ea; color: #137333; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 20px 0; }
+  .stat { background: #f8f9fa; border-radius: 10px; padding: 16px; }
+  .stat-val { font-size: 26px; font-weight: 700; color: #1a73e8; }
+  .stat-lbl { font-size: 11px; color: #888; margin-top: 4px; text-transform: uppercase; }
+  .bar { height: 6px; border-radius: 3px; background: #e8eaed; margin-top: 8px; }
+  .bar-fill { height: 100%; border-radius: 3px; }
+  .info-row { display: flex; justify-content: space-between; font-size: 13px; color: #666; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+  .info-val { color: #333; font-weight: 500; }
+  .footer { margin-top: 20px; font-size: 12px; color: #bbb; text-align: center; }
+</style>
+<script>setTimeout(() => location.reload(), 5000);</script>
+</head>
+<body>
+<div class="card">
+  <span class="badge">GCP Cloud Instance</span>
+  <h1>Auto-Scaled Web App</h1>
+  <p style="color:#666;margin-bottom:16px">Served by: <strong style="color:#1a73e8">{{ hostname }}</strong></p>
+  <div class="grid">
+    <div class="stat">
+      <div class="stat-val">{{ cpu }}%</div>
+      <div class="stat-lbl">CPU Usage</div>
+      <div class="bar"><div class="bar-fill" style="width:{{ cpu }}%;background:#1a73e8"></div></div>
+    </div>
+    <div class="stat">
+      <div class="stat-val">{{ mem }}%</div>
+      <div class="stat-lbl">Memory</div>
+      <div class="bar"><div class="bar-fill" style="width:{{ mem }}%;background:#34a853"></div></div>
+    </div>
+  </div>
+  <div>
+    <div class="info-row"><span>Server IP</span><span class="info-val">{{ ip }}</span></div>
+    <div class="info-row"><span>Server time</span><span class="info-val">{{ time }}</span></div>
+  </div>
+  <p class="footer">VCC Assignment 3 · GCP Auto-Scaled Instance</p>
+</div>
+</body>
+</html>'''
+
+@app.route("/")
+def home():
+    cpu = round(psutil.cpu_percent(interval=0.5), 1)
+    mem = round(psutil.virtual_memory().percent, 1)
+    return render_template_string(HTML,
+        hostname=platform.node(), cpu=cpu, mem=mem,
+        ip=socket.gethostbyname(socket.gethostname()),
+        time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "hostname": platform.node()})
+
+@app.route("/metrics")
+def metrics():
+    return jsonify({
+        "hostname": platform.node(),
+        "cpu_percent": round(psutil.cpu_percent(interval=0.5), 1),
+        "memory_percent": round(psutil.virtual_memory().percent, 1),
+        "timestamp": datetime.datetime.now().isoformat(),
+    })
+
+app.run(host="0.0.0.0", port=5000, debug=False)
+PYEOF
+nohup python3 /tmp/app.py &> /tmp/app.log &
+"""
+
+
+def create_gcp_instance(name: str) -> bool:
+    log.info("Creating GCP instance: %s", name)
+    startup_file = f"/tmp/startup_{name}.sh"
     with open(startup_file, "w") as f:
-        f.write(startup_content)
+        f.write(STARTUP_SCRIPT)
 
     result = subprocess.run([
-        "gcloud", "compute", "instances", "create", GCP_INSTANCE_NAME,
+        "gcloud", "compute", "instances", "create", name,
         "--project",       GCP_PROJECT,
         "--zone",          GCP_ZONE,
         "--machine-type",  GCP_MACHINE_TYPE,
@@ -103,72 +258,94 @@ def create_gcp_instance() -> bool:
     ], capture_output=True, text=True)
 
     if result.returncode == 0:
-        log.info("GCP instance created successfully.")
+        log.info("Instance %s created. Waiting for IP...", name)
+        # Wait a moment then get IP
+        time.sleep(10)
+        ip = get_instance_ip(name)
+        gcp_instances[name] = {"ip": ip, "cpu": 0.0, "status": "RUNNING"}
+        log.info("Instance %s IP: %s", name, ip)
+        write_nginx_conf()
         return True
     else:
-        log.error("Failed to create instance: %s", result.stderr)
+        log.error("Failed to create %s: %s", name, result.stderr.strip())
         return False
 
-def delete_gcp_instance() -> bool:
-    """Terminate the GCP VM when resources drop back below threshold."""
-    log.info("Deleting GCP instance: %s", GCP_INSTANCE_NAME)
+
+def delete_gcp_instance(name: str) -> bool:
+    log.info("Deleting GCP instance: %s", name)
     result = subprocess.run([
-        "gcloud", "compute", "instances", "delete", GCP_INSTANCE_NAME,
+        "gcloud", "compute", "instances", "delete", name,
         "--project", GCP_PROJECT,
         "--zone",    GCP_ZONE,
         "--quiet"
     ], capture_output=True, text=True)
 
     if result.returncode == 0:
-        log.info("GCP instance deleted.")
+        gcp_instances.pop(name, None)
+        write_nginx_conf()
+        log.info("Instance %s deleted.", name)
         return True
     else:
-        log.error("Failed to delete instance: %s", result.stderr)
+        log.error("Failed to delete %s: %s", name, result.stderr.strip())
         return False
 
 
-def scale_out():
-    global scaled_out, last_scale_time
-    if not is_instance_running(GCP_INSTANCE_NAME):
-        if create_gcp_instance():
-            scaled_out = True
-            last_scale_time = time.time()
-    else:
-        log.info("Instance already running — skipping creation.")
-        scaled_out = True
-
-
-def scale_in():
-    global scaled_out
-    if is_instance_running(GCP_INSTANCE_NAME):
-        if delete_gcp_instance():
-            scaled_out = False
-    else:
-        scaled_out = False
-
+# ─── Main loop ─────────────────────────────────────────────────────────────
 
 def main():
-    global scaled_out, last_scale_time
-    log.info("=== Resource Monitor Started (threshold=%.0f%%) ===", THRESHOLD)
+    global last_scale_time
+    log.info("=== Resource Monitor Started (threshold=%.0f%%, max_instances=%d) ===",
+             THRESHOLD, MAX_GCP_INSTANCES)
+
+    # Write initial nginx conf (local only)
+    write_nginx_conf()
 
     while True:
-        cpu = get_cpu_percent()
-        mem = get_memory_percent()
-        log.info("CPU: %.1f%%  |  Memory: %.1f%%  |  Scaled-out: %s",
-                 cpu, mem, scaled_out)
+        now     = time.time()
+        cpu     = round(psutil.cpu_percent(interval=1.0), 1)
+        mem     = round(psutil.virtual_memory().percent, 1)
+        n_inst  = len(gcp_instances)
+        cooldown_ok = (now - last_scale_time) > COOLDOWN_PERIOD
 
-        now = time.time()
+        log.info("CPU: %.1f%%  |  Memory: %.1f%%  |  GCP instances: %d", cpu, mem, n_inst)
+
+        # ── 1. Poll GCP instance CPUs ───────────────────────────────────
+        for name in list(gcp_instances.keys()):
+            ip = gcp_instances[name].get("ip")
+            if ip:
+                inst_cpu = poll_instance_cpu(ip)
+                if inst_cpu is not None:
+                    gcp_instances[name]["cpu"] = inst_cpu
+                    log.info("  GCP %s CPU: %.1f%%", name, inst_cpu)
+                    # GCP-side autoscale
+                    if inst_cpu > THRESHOLD and n_inst < MAX_GCP_INSTANCES and cooldown_ok:
+                        log.warning("GCP instance %s overloaded (%.1f%%) — adding another", name, inst_cpu)
+                        new_name = next_instance_name()
+                        if new_name:
+                            if create_gcp_instance(new_name):
+                                last_scale_time = now
+                else:
+                    log.warning("  GCP %s unreachable", name)
+
+        # ── 2. Local VM threshold check ─────────────────────────────────
         resource_high = cpu > THRESHOLD or mem > THRESHOLD
-        cooldown_ok   = (now - last_scale_time) > COOLDOWN_PERIOD
+        no_instances  = len(gcp_instances) == 0
 
-        if resource_high and not scaled_out and cooldown_ok:
-            log.warning("THRESHOLD EXCEEDED — triggering scale-out! "
-                        "(CPU=%.1f%%, MEM=%.1f%%)", cpu, mem)
-            scale_out()
+        if resource_high and no_instances and cooldown_ok:
+            log.warning("LOCAL THRESHOLD EXCEEDED (CPU=%.1f%%, MEM=%.1f%%) — scale-out", cpu, mem)
+            name = next_instance_name()
+            if name and create_gcp_instance(name):
+                last_scale_time = now
 
-        elif not resource_high and scaled_out and cooldown_ok:
-            log.info("Resources back to normal — triggering scale-in.")
-            scale_in()
+        elif not resource_high and len(gcp_instances) > 0 and cooldown_ok:
+            # Scale in — delete all GCP instances
+            log.info("Resources back to normal — scaling in")
+            for name in list(gcp_instances.keys()):
+                delete_gcp_instance(name)
+            last_scale_time = now
+
+        # ── 3. Save state for dashboard ─────────────────────────────────
+        save_state(cpu, mem)
 
         time.sleep(CHECK_INTERVAL)
 
