@@ -260,7 +260,7 @@ def create_gcp_instance(name: str) -> bool:
     if result.returncode == 0:
         log.info("Instance %s created. Waiting for IP...", name)
         # Wait a moment then get IP
-        time.sleep(10)
+        time.sleep(90)
         ip = get_instance_ip(name)
         gcp_instances[name] = {"ip": ip, "cpu": 0.0, "status": "RUNNING"}
         log.info("Instance %s IP: %s", name, ip)
