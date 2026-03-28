@@ -18,7 +18,7 @@ COOLDOWN_PERIOD  = 300           # 5 min cooldown after a scale action
 LOG_FILE         = "monitor.log"
 
 # GCP settings (edit these)
-GCP_PROJECT      = "your-project-id"
+GCP_PROJECT      = "cloudburstarchitecture"
 GCP_ZONE         = "us-central1-a"
 GCP_INSTANCE_NAME= "autoscale-instance"
 GCP_MACHINE_TYPE = "e2-medium"
@@ -62,35 +62,44 @@ def is_instance_running(name: str) -> bool:
 
 
 def create_gcp_instance() -> bool:
-    """Spin up a new GCP VM and deploy the sample application."""
     log.info("Creating GCP instance: %s", GCP_INSTANCE_NAME)
 
-    startup = (
-        "#!/bin/bash\n"
-        "apt-get update -y\n"
-        "apt-get install -y python3-pip\n"
-        "pip3 install flask\n"
-        "cat > /tmp/app.py << 'EOF'\n"
-        "from flask import Flask\n"
-        "app = Flask(__name__)\n"
-        "@app.route('/')\n"
-        "def home():\n"
-        "    return '<h1>Auto-Scaled App Running on GCP!</h1>'\n"
-        "if __name__ == '__main__':\n"
-        "    app.run(host='0.0.0.0', port=80)\n"
-        "EOF\n"
-        "nohup python3 /tmp/app.py &> /tmp/app.log &\n"
-    )
+    # Write startup script to a temp file
+    startup_content = """#!/bin/bash
+                        apt-get update -y
+                        apt-get install -y python3-pip
+                        pip3 install flask --break-system-packages
+                        cat > /tmp/app.py << 'APPEOF'
+                        from flask import Flask
+                        app = Flask(__name__)
+
+                        @app.route('/')
+                        def home():
+                            return '<h1>Auto-Scaled App Running on GCP!</h1>'
+
+                        @app.route('/health')
+                        def health():
+                            return 'ok', 200
+
+                        if __name__ == '__main__':
+                            app.run(host='0.0.0.0', port=80)
+                        APPEOF
+                        nohup python3 /tmp/app.py &> /tmp/app.log &
+                        """
+
+    startup_file = "/tmp/gcp_startup.sh"
+    with open(startup_file, "w") as f:
+        f.write(startup_content)
 
     result = subprocess.run([
         "gcloud", "compute", "instances", "create", GCP_INSTANCE_NAME,
-        "--project",      GCP_PROJECT,
-        "--zone",         GCP_ZONE,
-        "--machine-type", GCP_MACHINE_TYPE,
-        "--image-family", GCP_IMAGE_FAMILY,
+        "--project",       GCP_PROJECT,
+        "--zone",          GCP_ZONE,
+        "--machine-type",  GCP_MACHINE_TYPE,
+        "--image-family",  GCP_IMAGE_FAMILY,
         "--image-project", GCP_IMAGE_PROJECT,
-        "--tags",         "http-server",
-        "--metadata",     f"startup-script={startup}",
+        "--tags",          "http-server",
+        "--metadata-from-file", f"startup-script={startup_file}",
     ], capture_output=True, text=True)
 
     if result.returncode == 0:
@@ -99,7 +108,6 @@ def create_gcp_instance() -> bool:
     else:
         log.error("Failed to create instance: %s", result.stderr)
         return False
-
 
 def delete_gcp_instance() -> bool:
     """Terminate the GCP VM when resources drop back below threshold."""
