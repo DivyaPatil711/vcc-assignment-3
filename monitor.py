@@ -289,6 +289,26 @@ def delete_gcp_instance(name: str) -> bool:
         log.error("Failed to delete %s: %s", name, result.stderr.strip())
         return False
 
+def load_existing_instances():
+    log.info("Scanning for existing GCP instances...")
+    result = subprocess.run([
+        "gcloud", "compute", "instances", "list",
+        "--project", GCP_PROJECT,
+        "--zones", GCP_ZONE,
+        "--filter", "name~autoscale-instance AND status=RUNNING",
+        "--format=value(name,networkInterfaces[0].accessConfigs[0].natIP)"
+    ], capture_output=True, text=True)
+    if result.returncode == 0:
+        for line in result.stdout.strip().splitlines():
+            if line.strip():
+                parts = line.split()
+                name = parts[0]
+                ip = parts[1] if len(parts) > 1 else None
+                gcp_instances[name] = {"ip": ip, "cpu": 0.0, "status": "RUNNING"}
+                log.info("Recovered instance: %s (%s)", name, ip)
+        if gcp_instances:
+            write_nginx_conf()
+            save_state(0, 0)
 
 # ─── Main loop ─────────────────────────────────────────────────────────────
 
@@ -296,7 +316,7 @@ def main():
     global last_scale_time
     log.info("=== Resource Monitor Started (threshold=%.0f%%, max_instances=%d) ===",
              THRESHOLD, MAX_GCP_INSTANCES)
-
+    load_existing_instances() 
     # Write initial nginx conf (local only)
     write_nginx_conf()
 
