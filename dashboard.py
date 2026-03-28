@@ -10,9 +10,10 @@ import psutil
 
 app = Flask(__name__)
 
-STATE_FILE = "../state.json"
-LOG_FILE   = "../monitor.log"
-
+import os
+BASE       = os.path.expanduser("~/vcc-assignment-3")
+STATE_FILE = os.path.join(BASE, "state.json")
+LOG_FILE   = os.path.join(BASE, "monitor.log")
 # In-memory history for charts (last 60 readings = 30 min at 30s intervals)
 cpu_hist  = deque(maxlen=60)
 mem_hist  = deque(maxlen=60)
