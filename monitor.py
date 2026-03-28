@@ -142,8 +142,10 @@ def next_instance_name():
 
 STARTUP_SCRIPT = r"""#!/bin/bash
 apt-get update -y
-apt-get install -y python3-pip
-pip3 install flask psutil --break-system-packages
+apt-get install -y python3-pip python3-venv
+python3 -m venv /opt/appenv
+/opt/appenv/bin/pip install flask psutil
+
 cat > /tmp/app.py << 'PYEOF'
 from flask import Flask, jsonify, render_template_string
 import platform, psutil, socket, datetime
@@ -227,7 +229,7 @@ def metrics():
 
 app.run(host="0.0.0.0", port=5000, debug=False)
 PYEOF
-nohup python3 /tmp/app.py &> /tmp/app.log &
+nohup /opt/appenv/bin/python3 /tmp/app.py &> /tmp/app.log &
 """
 
 
