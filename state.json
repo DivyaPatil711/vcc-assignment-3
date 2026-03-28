@@ -1,0 +1,16 @@
+{
+  "local_cpu": 100.0,
+  "local_mem": 20.6,
+  "scaled_out": true,
+  "instance_count": 1,
+  "instances": [
+    {
+      "name": "autoscale-instance-0",
+      "ip": "34.63.59.27",
+      "cpu": 2.0,
+      "status": "RUNNING"
+    }
+  ],
+  "last_update": "2026-03-28T17:59:17.208260",
+  "threshold": 75.0
+}

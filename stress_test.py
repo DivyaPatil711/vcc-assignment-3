@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description="CPU stress test")
     parser.add_argument("--cpu",      type=int, default=80,
                         help="Target CPU % (default 80)")
-    parser.add_argument("--duration", type=int, default=120,
+    parser.add_argument("--duration", type=int, default=6000,
                         help="Duration in seconds (default 120)")
     args = parser.parse_args()
 
